@@ -17,6 +17,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -24,6 +25,17 @@ DEFAULT_LIGHT_THEME = "org.kde.breeze.desktop"
 DEFAULT_DARK_THEME = "org.kde.breezedark.desktop"
 FALLBACK_LIGHT_SCHEME = "Breeze"
 FALLBACK_DARK_SCHEME = "BreezeDark"
+
+# 切换后等待系统各条主题通道对齐的最长时间（秒）；可用 DARKLIGHT_SETTLE_TIMEOUT 覆盖。
+DEFAULT_SETTLE_TIMEOUT = 1.6
+SETTLE_POLL_INTERVAL = 0.05
+# 未命中系统预设时的提示前缀。界面按这个前缀识别并弹出带按钮的系统通知，
+# 前缀之后（最后一个「：」之后）是本次实际使用的主题名，改动时两处要一起改。
+NOTICE_PREFIX = "darklight-toggle: 提示：未配置深浅主题预设"
+NOTICE_SOURCE_LABELS = {"derived": "按名称推断", "default": "使用兜底默认"}
+# 对齐后、补发通知前的静默期（秒）：应用是在收到通知的那一刻去读值的，
+# 紧接着第一批通知补发，读到的往往还是旧值。可用 DARKLIGHT_NUDGE_DELAY 覆盖。
+DEFAULT_NUDGE_DELAY = 0.6
 
 # 主题名称里可能出现的明暗标记，用于判断状态和寻找配对主题。
 DARK_TOKENS = ("dark", "深色", "night", "夜间")
@@ -191,18 +203,27 @@ def preset_look_and_feel(parser: configparser.ConfigParser, target_mode: str) ->
     return ""
 
 
-def detect_mode(parser: configparser.ConfigParser) -> str:
-    # 以用户实际看到的明暗为准，这样图标和屏幕状态始终一致。
-    portal = portal_mode()
-    if portal:
-        return portal
+def config_mode(parser: configparser.ConfigParser) -> Optional[str]:
+    """按配置文件判断当前明暗（配色方案名 → 全局主题名 → 调色板亮度）。
+
+    这是「已经应用了什么主题」的权威来源：主题是脚本写进 kdeglobals 的，
+    写完之后立刻可读；而门户值在切换刚发生时可能还停在上一代。
+    """
     named = mode_from_name(current_color_scheme(parser))
     if named:
         return named
     named = mode_from_name(current_look_and_feel(parser))
     if named:
         return named
-    return palette_mode(parser) or "light"
+    return palette_mode(parser)
+
+
+def detect_mode(parser: configparser.ConfigParser) -> str:
+    # 状态显示以用户实际看到的明暗为准（门户优先），这样图标和屏幕状态一致。
+    portal = portal_mode()
+    if portal:
+        return portal
+    return config_mode(parser) or "light"
 
 
 def available_look_and_feel() -> set[str]:
@@ -260,10 +281,14 @@ def common_prefix_length(left: str, right: str) -> int:
     return length
 
 
-def counterpart_theme(theme: str, available: set[str], target_mode: str) -> Optional[str]:
-    """在当前主题的基础上，找到明暗相反且系统中确实存在的主题 ID。"""
+def counterpart_theme(theme: str, available: set[str], target_mode: str) -> Tuple[Optional[str], str]:
+    """在当前主题的基础上，找到明暗相反且系统中确实存在的主题 ID。
+
+    返回 (主题 ID, 来源)：来源 derived 表示按名称推断，default 表示用了兜底默认主题。
+    """
     if not available:
-        return DEFAULT_DARK_THEME if target_mode == "dark" else DEFAULT_LIGHT_THEME
+        theme_id = DEFAULT_DARK_THEME if target_mode == "dark" else DEFAULT_LIGHT_THEME
+        return theme_id, "default"
 
     candidates: list[str] = []
     for source, destination in SWAP_PAIRS:
@@ -275,10 +300,10 @@ def counterpart_theme(theme: str, available: set[str], target_mode: str) -> Opti
     normalized = {normalize(name): name for name in available}
     for candidate in candidates:
         if candidate in available:
-            return candidate
+            return candidate, "derived"
         found = normalized.get(normalize(candidate))
         if found:
-            return found
+            return found, "derived"
 
     # 名称里没有明暗标记时（如 org.kde.breeze.desktop），按系列相似度挑选。
     base = theme
@@ -297,7 +322,7 @@ def counterpart_theme(theme: str, available: set[str], target_mode: str) -> Opti
     if scored:
         scored.sort(key=lambda item: (-item[0], item[1]))
         if scored[0][0] > 0 or not base_normalized:
-            return scored[0][1]
+            return scored[0][1], "derived"
 
     defaults = (
         (DEFAULT_DARK_THEME, DEFAULT_LIGHT_THEME)
@@ -306,14 +331,31 @@ def counterpart_theme(theme: str, available: set[str], target_mode: str) -> Opti
     )
     for default in defaults:
         if default in available:
-            return default
+            return default, "default"
         found = normalized.get(normalize(default))
         if found:
-            return found
-    return None
+            return found, "default"
+    return None, "none"
 
 
-def apply_look_and_feel(theme: str) -> None:
+def resolve_theme(parser: configparser.ConfigParser, target_mode: str) -> Tuple[Optional[str], str]:
+    """解析目标主题，返回 (主题 ID, 来源)。
+
+    来源 preset 表示命中了「系统设置 → 外观 → 全局主题」里预设的那一对，这是唯一
+    完全符合预期的来源；derived / default 都是推测，需要提示用户去配置。
+    """
+    preset = preset_look_and_feel(parser, target_mode)
+    if preset:
+        return preset, "preset"
+    return counterpart_theme(
+        current_look_and_feel(parser),
+        available_look_and_feel(),
+        target_mode,
+    )
+
+
+def apply_look_and_feel(theme: str) -> str:
+    """应用主题，返回实际使用的机制：lookandfeel 或 colorscheme。"""
     executable = shutil.which("plasma-apply-lookandfeel")
     if executable:
         # 本机版本只接受 --apply，位置参数会被当作帮助请求并静默成功。
@@ -326,7 +368,7 @@ def apply_look_and_feel(theme: str) -> None:
         if result.returncode != 0:
             detail = (result.stderr or result.stdout or "无错误输出").strip()
             raise RuntimeError(f"应用全局主题 {theme!r} 失败：{detail}")
-        return
+        return "lookandfeel"
 
     # 没有全局主题工具时，退化为切换系统自带的 Breeze 配色。
     fallback = shutil.which("plasma-apply-colorscheme")
@@ -342,11 +384,101 @@ def apply_look_and_feel(theme: str) -> None:
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "无错误输出").strip()
         raise RuntimeError(f"应用配色方案 {scheme!r} 失败：{detail}")
+    return "colorscheme"
+
+
+def gtk_dark_preference() -> Optional[bool]:
+    """读取 GTK 侧的「偏好深色」开关，即 kde-gtk-config 同步的另一条通道。"""
+    for directory in ("gtk-3.0", "gtk-4.0"):
+        parser = load_config(f"{directory}/settings.ini")
+        if not parser.has_section("Settings"):
+            continue
+        raw = parser.get("Settings", "gtk-application-prefer-dark-theme", fallback="").strip().lower()
+        if raw in ("true", "1", "yes"):
+            return True
+        if raw in ("false", "0", "no"):
+            return False
+    return None
+
+
+def settle_timeout() -> float:
+    raw = os.environ.get("DARKLIGHT_SETTLE_TIMEOUT", "").strip()
+    try:
+        value = float(raw) if raw else DEFAULT_SETTLE_TIMEOUT
+    except ValueError:
+        value = DEFAULT_SETTLE_TIMEOUT
+    return min(max(value, 0.0), 10.0)
+
+
+def nudge_delay() -> float:
+    raw = os.environ.get("DARKLIGHT_NUDGE_DELAY", "").strip()
+    try:
+        value = float(raw) if raw else DEFAULT_NUDGE_DELAY
+    except ValueError:
+        value = DEFAULT_NUDGE_DELAY
+    return min(max(value, 0.0), 10.0)
+
+
+def debug(message: str) -> None:
+    if os.environ.get("DARKLIGHT_DEBUG"):
+        print(f"darklight-toggle: {message}", file=sys.stderr)
+
+
+def wait_for_settle(target_mode: str) -> bool:
+    """等门户与 GTK 两条通道都更新到目标模式，返回是否在超时前对齐。
+
+    KDE 一次切换要经过多条异步通道：门户的 color-scheme 几乎立刻更新，
+    GTK 侧（kde-gtk-config）通常滞后 0.1～0.4 秒。补发的通知必须等全部对齐后再发，
+    否则补出去的那一批仍携带过渡态。
+    """
+    portal_observable = portal_mode() is not None
+    gtk_observable = gtk_dark_preference() is not None
+    if not portal_observable and not gtk_observable:
+        # 两条通道都读不到（无 D-Bus、无 GTK 配置）时无从等待，直接补发即可。
+        return True
+
+    want_dark = target_mode == "dark"
+    deadline = time.monotonic() + settle_timeout()
+    while True:
+        portal_ok = not portal_observable or portal_mode() == target_mode
+        gtk_ok = not gtk_observable or gtk_dark_preference() == want_dark
+        if portal_ok and gtk_ok:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(SETTLE_POLL_INTERVAL)
+
+
+def nudge_enabled(choice: Optional[str]) -> bool:
+    raw = choice or os.environ.get("DARKLIGHT_NUDGE") or "always"
+    return raw.strip().lower() not in ("never", "no", "false", "off", "0")
+
+
+def nudge_theme(theme: str) -> None:
+    """再应用一次同一全局主题，补发一批配置变更通知。
+
+    背景：Chromium 系（Electron）应用在 KDE 上处理 color-scheme 通知时会错后一代，
+    表现为「启动后第一次切换不生效、之后再切就是反相」。补发同一主题的通知可以让
+    内核前进一代并与系统对齐；主题值不变，视觉上没有差异。
+    """
+    apply_look_and_feel(theme)
+
+
+def announce_fallback(source: str, theme: str) -> None:
+    """未命中预设时告知用户：本次用的是推测/兜底主题，并说明怎么改成预期配置。"""
+    label = NOTICE_SOURCE_LABELS.get(source, "使用兜底")
+    print(f"{NOTICE_PREFIX}，本次{label}：{theme}", file=sys.stderr)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="查询或切换 KDE Plasma 的浅色/深色模式")
     parser.add_argument("action", choices=("status", "toggle", "light", "dark"))
+    parser.add_argument(
+        "--nudge",
+        choices=("always", "never"),
+        default=None,
+        help="切换后是否补发一次主题通知（默认 always，可用 DARKLIGHT_NUDGE=0 关闭）",
+    )
     return parser
 
 
@@ -365,20 +497,41 @@ def main(argv: Optional[list[str]] = None) -> int:
         elif args.action == "light":
             target_mode = "light"
         else:
-            target_mode = "dark" if mode == "light" else "light"
+            # 切换方向以配置为准：门户值在切换刚结束的几百毫秒内可能是上一代，
+            # 照它判方向会出现「点了没反应」（目标主题其实已在用）。
+            current = config_mode(kdeglobals) or mode
+            target_mode = "dark" if current == "light" else "light"
 
         # 优先使用系统设置里预设的深浅主题（DefaultDark/LightLookAndFeel）。
-        theme = preset_look_and_feel(kdeglobals, target_mode)
-        if not theme:
-            # 用户没有预设时才回退到按名称推导配对主题。
-            theme = counterpart_theme(
-                current_look_and_feel(kdeglobals),
-                available_look_and_feel(),
-                target_mode,
-            )
+        theme, source = resolve_theme(kdeglobals, target_mode)
         if not theme:
             raise RuntimeError("找不到与当前主题配对的深色/浅色全局主题")
-        apply_look_and_feel(theme)
+        if source != "preset":
+            # 推测/兜底出来的配对可能不是用户想要的那一对，明确告知。
+            announce_fallback(source, theme)
+        method = apply_look_and_feel(theme)
+        # 补发一次同值通知：修 Chromium/Electron 系应用「错后一代」的问题。
+        # 仅全局主题机制才有效；配色方案回放不会产生新的配置变更通知。
+        if method == "lookandfeel" and nudge_enabled(args.nudge):
+            try:
+                started = time.monotonic()
+                settled = wait_for_settle(target_mode)
+                debug(f"对齐耗时 {int((time.monotonic() - started) * 1000)}ms（超时={not settled}）")
+                delay = nudge_delay()
+                if delay > 0:
+                    time.sleep(delay)
+                nudge_theme(theme)
+                debug(f"已补发通知，总耗时 {int((time.monotonic() - started) * 1000)}ms")
+                if not settled:
+                    print(
+                        "darklight-toggle: 警告：GTK 侧未在超时内同步，已补发通知",
+                        file=sys.stderr,
+                    )
+            except Exception as error:  # noqa: BLE001 - 主题已切换，补发失败只降级为警告
+                print(
+                    f"darklight-toggle: 警告：补发通知失败（主题已切换）：{error}",
+                    file=sys.stderr,
+                )
         print(target_mode)
         return 0
     except Exception as error:  # noqa: BLE001 - 统一转成命令行错误

@@ -11,7 +11,7 @@
     "Id": "io.github.io-oss.darklightswitch",
     "License": "MIT",
     "Name": "深浅模式切换 / Dark-Light Switch",
-    "Version": "1.0.0"
+    "Version": "1.2.0"
   },
   "X-Plasma-API-Minimum-Version": "6.0",
   "KPackageStructure": "Plasma/Applet"

@@ -36,7 +36,37 @@ PlasmoidItem {
     }
 
     function toggle() {
+        // 切换要等 GTK 通道对齐后再补发一次通知，耗时约 1～1.5 秒；
+        // 先按用户预期翻转图标，命令返回后再用真实状态校正。
+        root.isDark = !root.isDark;
         actionSource.run(toggleCommand());
+    }
+
+    // 切换脚本的提示前缀：命中不了预设时它会把「本次实际用了哪个主题」写到 stderr。
+    // 这个前缀在脚本里是 NOTICE_PREFIX，两处必须保持一致。
+    readonly property string noticeMarker: "darklight-toggle: 提示：未配置深浅主题预设"
+
+    // 每个会话只提示一次，避免每次点击都弹。
+    property bool presetNoticeShown: false
+    property string pendingNoticeTheme: ""
+
+    function maybeAnnounce(stderrText) {
+        if (root.presetNoticeShown) return;
+        var text = String(stderrText || "");
+        var start = text.indexOf(root.noticeMarker);
+        if (start < 0) return;
+        root.presetNoticeShown = true;
+        var end = text.indexOf("\n", start);
+        var line = end < 0 ? text.substring(start) : text.substring(start, end);
+        // 前缀之后、最后一个「：」之后是主题名。
+        var theme = line.substring(line.lastIndexOf("：") + 1).trim();
+        if (noticeLoader.item) noticeLoader.item.show(theme);
+        else root.pendingNoticeTheme = theme;
+    }
+
+    function openAppearanceSettings() {
+        var command = "systemsettings kcm_lookandfeel >/dev/null 2>&1 || kcmshell6 kcm_lookandfeel";
+        openerSource.run("sh -c " + shellQuote(command));
     }
 
     // 低频轮询，保证通过系统设置或定时任务改变主题后图标仍然同步。
@@ -47,7 +77,32 @@ PlasmoidItem {
         connectedSources: [statusCommand()]
         onNewData: (sourceName, data) => {
             if (data && data["stdout"]) applyResult(data["stdout"]);
+            if (data && data["stderr"]) maybeAnnounce(data["stderr"]);
         }
+    }
+
+    // 通知组件单独成文件：缺少 KNotifications QML 插件时只有它加载失败，小部件本体不受影响。
+    Loader {
+        id: noticeLoader
+        source: "PresetNotice.qml"
+        onStatusChanged: {
+            if (status === Loader.Error) console.warn("darklightswitch: 通知组件加载失败");
+        }
+        onLoaded: {
+            item.configureRequested.connect(root.openAppearanceSettings);
+            if (root.pendingNoticeTheme !== "") {
+                item.show(root.pendingNoticeTheme);
+                root.pendingNoticeTheme = "";
+            }
+        }
+    }
+
+    // 只用一次：点击通知里的按钮时打开「外观 → 全局主题」。
+    Plasma5Support.DataSource {
+        id: openerSource
+        engine: "executable"
+        connectedSources: []
+        onNewData: (sourceName, data) => openerSource.disconnectSource(sourceName)
     }
 
     // 一次性命令源，每次点击复用，避免频繁创建/销毁数据源。
@@ -61,8 +116,14 @@ PlasmoidItem {
         }
 
         onNewData: (sourceName, data) => {
-            if (data && data["stdout"]) applyResult(data["stdout"]);
             actionSource.disconnectSource(sourceName);
+            var code = data && data["exit code"] !== undefined ? parseInt(data["exit code"], 10) : 0;
+            if (!isNaN(code) && code !== 0) {
+                // 切换失败：重读一次真实状态，纠正刚才乐观翻转的图标。
+                actionSource.run(statusCommand());
+                return;
+            }
+            if (data && data["stdout"]) applyResult(data["stdout"]);
         }
     }
 
