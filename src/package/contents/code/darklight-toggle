@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""查询/切换 KDE Plasma 的深色、浅色模式。
+
+不在此处指定具体主题：直接使用系统设置里已配置好的全局主题配对，
+通过 plasma-apply-lookandfeel --apply 应用对应主题。
+输出为单行 light 或 dark。
+"""
+
+from __future__ import annotations
+
+import argparse
+import configparser
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Optional, Tuple
+
+DEFAULT_LIGHT_THEME = "org.kde.breeze.desktop"
+DEFAULT_DARK_THEME = "org.kde.breezedark.desktop"
+FALLBACK_LIGHT_SCHEME = "Breeze"
+FALLBACK_DARK_SCHEME = "BreezeDark"
+
+# 主题名称里可能出现的明暗标记，用于判断状态和寻找配对主题。
+DARK_TOKENS = ("dark", "深色", "night", "夜间")
+LIGHT_TOKENS = ("light", "浅色", "day", "白天")
+# 浅色 -> 深色 的替换对（含反向），按长度从长到短排列避免误替换。
+SWAP_PAIRS: Tuple[Tuple[str, str], ...] = (
+    ("浅色", "深色"),
+    ("深色", "浅色"),
+    ("LIGHT", "DARK"),
+    ("DARK", "LIGHT"),
+    ("Light", "Dark"),
+    ("Dark", "Light"),
+    ("light", "dark"),
+    ("dark", "light"),
+)
+
+
+def config_home() -> Path:
+    configured = os.environ.get("XDG_CONFIG_HOME")
+    return Path(configured) if configured else Path.home() / ".config"
+
+
+def data_dirs() -> list[Path]:
+    dirs: list[Path] = []
+    xdg_data_home = os.environ.get("XDG_DATA_HOME")
+    dirs.append(Path(xdg_data_home) if xdg_data_home else Path.home() / ".local" / "share")
+    for entry in os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(os.pathsep):
+        if entry:
+            dirs.append(Path(entry))
+    return dirs
+
+
+def load_config(filename: str) -> configparser.ConfigParser:
+    parser = configparser.ConfigParser(interpolation=None, strict=False)
+    parser.optionxform = str.lower
+    try:
+        with (config_home() / filename).open("r", encoding="utf-8", errors="replace") as handle:
+            parser.read_file(handle)
+    except (OSError, configparser.Error):
+        pass
+    return parser
+
+
+def kread(group: str, key: str, filename: str = "kdeglobals") -> str:
+    for tool in ("kreadconfig6", "kreadconfig5"):
+        executable = shutil.which(tool)
+        if not executable:
+            continue
+        try:
+            result = subprocess.run(
+                [executable, "--file", filename, "--group", group, "--key", key],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=5,
+            )
+            value = result.stdout.strip()
+            if value:
+                return value
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return ""
+
+
+def mode_from_name(name: str) -> Optional[str]:
+    lowered = name.lower()
+    if any(token in lowered for token in DARK_TOKENS):
+        return "dark"
+    if any(token in lowered for token in LIGHT_TOKENS):
+        return "light"
+    return None
+
+
+def parse_rgb(value: str) -> Optional[Tuple[int, int, int]]:
+    if not value:
+        return None
+    parts = [part for part in re.split(r"[,;\s]+", value.strip()) if part]
+    if len(parts) < 3:
+        return None
+    try:
+        numbers = tuple(int(round(float(part))) for part in parts[:3])
+    except ValueError:
+        return None
+    if all(0 <= number <= 255 for number in numbers):
+        return numbers  # type: ignore[return-value]
+    return None
+
+
+def relative_luminance(rgb: Tuple[int, int, int]) -> float:
+    def channel(value: int) -> float:
+        component = value / 255.0
+        return component / 12.92 if component <= 0.04045 else ((component + 0.055) / 1.055) ** 2.4
+
+    red, green, blue = rgb
+    return 0.2126 * channel(red) + 0.7152 * channel(green) + 0.0722 * channel(blue)
+
+
+def palette_mode(parser: configparser.ConfigParser) -> Optional[str]:
+    # Colors:View 是文档背景，比 Colors:Window 更能代表明暗模式。
+    for section in ("Colors:View", "Colors:Window"):
+        if parser.has_section(section):
+            rgb = parse_rgb(parser.get(section, "backgroundnormal", fallback=""))
+            if rgb:
+                return "dark" if relative_luminance(rgb) < 0.45 else "light"
+    return None
+
+
+def portal_mode() -> Optional[str]:
+    """通过 freedesktop portal 读取当前明暗，这是应用实际看到的值。"""
+    executable = shutil.which("dbus-send")
+    if not executable:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                executable,
+                "--session",
+                "--print-reply=literal",
+                "--dest=org.freedesktop.portal.Desktop",
+                "/org/freedesktop/portal/desktop",
+                "org.freedesktop.portal.Settings.ReadOne",
+                "string:org.freedesktop.appearance",
+                "string:color-scheme",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+        )
+        numbers = re.findall(r"\d+", result.stdout)
+        if numbers:
+            value = int(numbers[-1])
+            if value == 1:
+                return "dark"
+            if value == 2:
+                return "light"
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def current_look_and_feel(parser: configparser.ConfigParser) -> str:
+    name = kread("KDE", "LookAndFeelPackage")
+    if not name and parser.has_section("KDE"):
+        name = parser.get("KDE", "lookandfeelpackage", fallback="")
+    return name.strip()
+
+
+def current_color_scheme(parser: configparser.ConfigParser) -> str:
+    name = kread("General", "ColorScheme")
+    if not name and parser.has_section("General"):
+        name = parser.get("General", "colorscheme", fallback="")
+    return name.strip()
+
+
+def preset_look_and_feel(parser: configparser.ConfigParser, target_mode: str) -> str:
+    """读取系统设置里预设的深色/浅色全局主题（Automatic Look and Feel 的配对）。
+
+    对应 kdeglobals 的 [KDE] DefaultDarkLookAndFeel / DefaultLightLookAndFeel，
+    即用户在系统设置中指定的那两个主题，不自行猜测、也不写死。
+    """
+    key = "defaultdarklookandfeel" if target_mode == "dark" else "defaultlightlookandfeel"
+    if parser.has_section("KDE"):
+        return parser.get("KDE", key, fallback="").strip()
+    return ""
+
+
+def detect_mode(parser: configparser.ConfigParser) -> str:
+    # 以用户实际看到的明暗为准，这样图标和屏幕状态始终一致。
+    portal = portal_mode()
+    if portal:
+        return portal
+    named = mode_from_name(current_color_scheme(parser))
+    if named:
+        return named
+    named = mode_from_name(current_look_and_feel(parser))
+    if named:
+        return named
+    return palette_mode(parser) or "light"
+
+
+def available_look_and_feel() -> set[str]:
+    """列出系统可用的全局主题 ID（含用户自建的中文主题）。"""
+    names: set[str] = set()
+    executable = shutil.which("plasma-apply-lookandfeel")
+    if executable:
+        for option in ("--list", "-l"):
+            try:
+                result = subprocess.run(
+                    [executable, option],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    timeout=8,
+                )
+                lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+                if lines and not any("usage" in line.lower() or "用法" in line for line in lines):
+                    names.update(lines)
+                    break
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+    # 回退：直接扫描主题安装目录，兼容没有 --list 的旧版本。
+    for base in data_dirs():
+        directory = base / "plasma" / "look-and-feel"
+        if not directory.is_dir():
+            continue
+        for path in directory.iterdir():
+            if path.suffix == ".desktop":
+                names.add(path.name)
+            elif path.is_dir():
+                metadata = path / "metadata.json"
+                if metadata.is_file():
+                    try:
+                        data = json.loads(metadata.read_text(encoding="utf-8"))
+                        names.add(data.get("KPlugin", {}).get("Id") or path.name)
+                    except (OSError, ValueError):
+                        names.add(path.name)
+                else:
+                    names.add(path.name)
+    return names
+
+
+def normalize(name: str) -> str:
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]", "", name.lower())
+
+
+def common_prefix_length(left: str, right: str) -> int:
+    length = 0
+    for a, b in zip(left, right):
+        if a != b:
+            break
+        length += 1
+    return length
+
+
+def counterpart_theme(theme: str, available: set[str], target_mode: str) -> Optional[str]:
+    """在当前主题的基础上，找到明暗相反且系统中确实存在的主题 ID。"""
+    if not available:
+        return DEFAULT_DARK_THEME if target_mode == "dark" else DEFAULT_LIGHT_THEME
+
+    candidates: list[str] = []
+    for source, destination in SWAP_PAIRS:
+        if mode_from_name(source) == target_mode:
+            continue
+        if source in theme:
+            candidates.append(theme.replace(source, destination))
+
+    normalized = {normalize(name): name for name in available}
+    for candidate in candidates:
+        if candidate in available:
+            return candidate
+        found = normalized.get(normalize(candidate))
+        if found:
+            return found
+
+    # 名称里没有明暗标记时（如 org.kde.breeze.desktop），按系列相似度挑选。
+    base = theme
+    for source, _ in SWAP_PAIRS:
+        base = base.replace(source, "")
+    base_normalized = normalize(base)
+    scored: list[tuple[int, str]] = []
+    for name in available:
+        if mode_from_name(name) != target_mode:
+            continue
+        name_normalized = normalize(name)
+        score = common_prefix_length(base_normalized, name_normalized)
+        if base_normalized and (base_normalized in name_normalized or name_normalized in base_normalized):
+            score += 1000
+        scored.append((score, name))
+    if scored:
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        if scored[0][0] > 0 or not base_normalized:
+            return scored[0][1]
+
+    defaults = (
+        (DEFAULT_DARK_THEME, DEFAULT_LIGHT_THEME)
+        if target_mode == "dark"
+        else (DEFAULT_LIGHT_THEME, DEFAULT_DARK_THEME)
+    )
+    for default in defaults:
+        if default in available:
+            return default
+        found = normalized.get(normalize(default))
+        if found:
+            return found
+    return None
+
+
+def apply_look_and_feel(theme: str) -> None:
+    executable = shutil.which("plasma-apply-lookandfeel")
+    if executable:
+        # 本机版本只接受 --apply，位置参数会被当作帮助请求并静默成功。
+        result = subprocess.run(
+            [executable, "--apply", theme],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "无错误输出").strip()
+            raise RuntimeError(f"应用全局主题 {theme!r} 失败：{detail}")
+        return
+
+    # 没有全局主题工具时，退化为切换系统自带的 Breeze 配色。
+    fallback = shutil.which("plasma-apply-colorscheme")
+    if not fallback:
+        raise RuntimeError("找不到 plasma-apply-lookandfeel / plasma-apply-colorscheme")
+    scheme = FALLBACK_DARK_SCHEME if mode_from_name(theme) == "dark" else FALLBACK_LIGHT_SCHEME
+    result = subprocess.run(
+        [fallback, scheme],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "无错误输出").strip()
+        raise RuntimeError(f"应用配色方案 {scheme!r} 失败：{detail}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="查询或切换 KDE Plasma 的浅色/深色模式")
+    parser.add_argument("action", choices=("status", "toggle", "light", "dark"))
+    return parser
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        kdeglobals = load_config("kdeglobals")
+        mode = detect_mode(kdeglobals)
+
+        if args.action == "status":
+            print(mode)
+            return 0
+
+        if args.action == "dark":
+            target_mode = "dark"
+        elif args.action == "light":
+            target_mode = "light"
+        else:
+            target_mode = "dark" if mode == "light" else "light"
+
+        # 优先使用系统设置里预设的深浅主题（DefaultDark/LightLookAndFeel）。
+        theme = preset_look_and_feel(kdeglobals, target_mode)
+        if not theme:
+            # 用户没有预设时才回退到按名称推导配对主题。
+            theme = counterpart_theme(
+                current_look_and_feel(kdeglobals),
+                available_look_and_feel(),
+                target_mode,
+            )
+        if not theme:
+            raise RuntimeError("找不到与当前主题配对的深色/浅色全局主题")
+        apply_look_and_feel(theme)
+        print(target_mode)
+        return 0
+    except Exception as error:  # noqa: BLE001 - 统一转成命令行错误
+        print(f"darklight-toggle: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

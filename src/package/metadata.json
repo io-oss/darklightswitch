@@ -1,0 +1,18 @@
+{
+  "KPlugin": {
+    "Authors": [
+      {
+        "Name": "WorkBuddy"
+      }
+    ],
+    "Category": "System Information",
+    "Description": "一键切换 Plasma 的浅色与深色配色方案",
+    "Icon": "weather-moon",
+    "Id": "io.github.io-oss.darklightswitch",
+    "License": "MIT",
+    "Name": "深浅模式切换 / Dark-Light Switch",
+    "Version": "1.0.0"
+  },
+  "X-Plasma-API-Minimum-Version": "6.0",
+  "KPackageStructure": "Plasma/Applet"
+}

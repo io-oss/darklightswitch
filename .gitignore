@@ -1,0 +1,22 @@
+# Python 缓存（运行 py_compile / 测试产生）
+__pycache__/
+*.py[cod]
+
+# WorkBuddy 本地项目数据（工作日志含本机配置，不应入库）
+.workbuddy/
+
+# 误操作产生的回收站目录
+.Trash-0/
+
+# 编辑器 / IDE 临时文件
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+
+*.code-workspace
